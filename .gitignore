@@ -218,3 +218,20 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+# Dự án này
+data/*
+!data/.gitkeep
+results/raw/
+
+# LaTeX
+*.aux
+*.log
+*.out
+*.synctex.gz
+*.bbl
+*.blg
+
+# PDF của bài khác (tránh đưa file có bản quyền lên repo)
+references/*.pdf
+
+.vscode/
