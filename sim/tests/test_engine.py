@@ -1,10 +1,13 @@
 import numpy as np
 import pytest
 
+from tfmsim.block import build_block
 from tfmsim.engine import SimulationConfig, create_initial_state, simulate, step
 from tfmsim.estimators import last_block_weighted_mean
+from tfmsim.fees import burn_split, f_act, f_att, f_ui
 from tfmsim.mechanisms import DynamicAlpha, FixedAlpha
-from tfmsim.types import Tx
+from tfmsim.pricing import update_prices, utilization
+from tfmsim.types import ObjectState, Tx
 from tfmsim.workload import WorkloadConfig, generate_workload
 
 
@@ -96,16 +99,24 @@ def test_step_matches_simulate_and_snapshot_resume_is_identical():
     uninterrupted = simulate(workload, mechanism, config)
 
     state = create_initial_state(config)
+    step_records = []
     for candidate_block in workload:
-        state, _, _ = step(state, candidate_block.txs, mechanism, config)
-    stepped = simulate([], mechanism, config, initial_state=state)
-    assert stepped == uninterrupted
+        state, record, _ = step(state, candidate_block.txs, mechanism, config)
+        step_records.append(record)
+    assert tuple(step_records) == uninterrupted.records
+    assert state.prices == uninterrupted.final_state.prices
+    assert state.next_block_index == uninterrupted.final_state.next_block_index
 
     snapshot = create_initial_state(config)
+    prefix_records = []
     for candidate_block in workload[:4]:
-        snapshot, _, _ = step(snapshot, candidate_block.txs, mechanism, config)
+        snapshot, record, _ = step(snapshot, candidate_block.txs, mechanism, config)
+        prefix_records.append(record)
     continued = simulate(workload[4:], mechanism, config, initial_state=snapshot)
-    assert continued == uninterrupted
+    assert continued.records == uninterrupted.records[4:]
+    assert continued.price_history[0] == uninterrupted.price_history[4]
+    assert continued.price_history[-1] == uninterrupted.price_history[-1]
+    assert continued.final_state.prices == uninterrupted.final_state.prices
 
 
 def test_step_and_initial_state_do_not_share_mutable_history():
@@ -118,13 +129,13 @@ def test_step_and_initial_state_do_not_share_mutable_history():
         u=0.0,
     )
     advanced, _, _ = step(original, [tx], FixedAlpha(0.5, 0.125), config)
-    advanced.history[0][0].append((8.0, 1.0))
-    advanced.price_history[0][0] = 50.0
+    advanced.history[0][0] += ((8.0, 1.0),)
+    advanced.prices = (50.0, 1.0)
     assert original.history == {}
-    assert original.price_history[0][0] == 1.0
+    assert original.prices[0] == 1.0
 
     copied = simulate([], FixedAlpha(0.5, 0.125), config, initial_state=advanced)
-    copied.history[0][0].append((9.0, 1.0))
+    copied.final_state.history[0][0] = copied.final_state.history[0][0] + ((9.0, 1.0),)
     assert (9.0, 1.0) not in advanced.history[0][0]
 
 
@@ -219,3 +230,154 @@ def test_p_min_defaults_to_positive_fraction_and_rejects_zero_unless_opted_in():
         _config(p_min=0.0)
     explicit = _config(p_min=0.0, allow_zero_p_min=True)
     assert explicit.p_min == 0.0
+
+
+def test_history_window_bounds_state_and_preserves_recent_estimates():
+    workload = generate_workload(
+        WorkloadConfig(n_blocks=7, n_objects=2, lambda_per_object=5.0),
+        np.random.default_rng(811),
+    )
+    config = _config(history_window=3)
+    result = simulate(
+        workload,
+        DynamicAlpha(1.0, 1.0, 0.125, 0.5, last_block_weighted_mean),
+        config,
+    )
+    assert set(result.final_state.history) == {4, 5, 6}
+    assert len(result.final_state.history) == 3
+
+
+@pytest.mark.parametrize(
+    "mechanism_factory",
+    [
+        lambda: FixedAlpha(0.5, 0.125),
+        lambda: DynamicAlpha(1.0, 1.0, 0.125, 0.5, last_block_weighted_mean),
+    ],
+)
+def test_results_match_unbounded_history_with_equivalent_candidate_input(mechanism_factory):
+    workload = generate_workload(
+        WorkloadConfig(
+            n_blocks=12,
+            n_objects=2,
+            lambda_per_object=5.0,
+            epsilon=0.0,
+            max_demand_multiplier=1.0,
+        ),
+        np.random.default_rng(812),
+    )
+    result = simulate(workload, mechanism_factory(), _config())
+    assert len(result.records) == len(workload)
+    assert [record.index for record in result.records] == list(range(len(workload)))
+    assert len(result.history) == len(workload)
+
+
+@pytest.mark.parametrize(
+    "mechanism_factory",
+    [
+        lambda: FixedAlpha(0.5, 0.125),
+        lambda: DynamicAlpha(1.0, 1.0, 0.125, 0.5, last_block_weighted_mean),
+    ],
+)
+def test_outputs_match_pre_refactor_full_history_reference(mechanism_factory):
+    workload = generate_workload(
+        WorkloadConfig(
+            n_blocks=6,
+            n_objects=2,
+            lambda_per_object=4.0,
+            epsilon=0.0,
+            max_demand_multiplier=1.0,
+        ),
+        np.random.default_rng(813),
+    )
+    config = _config(epsilon=0.0, max_demand_multiplier=1.0)
+    mechanism = mechanism_factory()
+    actual = simulate(workload, mechanism, config)
+
+    states = {
+        obj: ObjectState(
+            obj,
+            config.initial_prices[obj],
+            config.target_utilization[obj],
+            p_min=config.p_min[obj] if isinstance(config.p_min, dict) else config.p_min,
+        )
+        for obj in config.object_ids
+    }
+    history = {}
+    expected_records = []
+    expected_prices = [{obj: states[obj].price for obj in config.object_ids}]
+    for block_index, candidate_block in enumerate(workload):
+        prices = {obj: states[obj].price for obj in config.object_ids}
+        params = mechanism.params_for_block(
+            block_index,
+            history,
+            object_ids=config.object_ids,
+        )
+        alpha = {obj: params[obj][0] for obj in config.object_ids}
+        eta = {obj: params[obj][1] for obj in config.object_ids}
+        built = build_block(
+            candidate_block.txs,
+            index=block_index,
+            max_compute=config.max_compute,
+            target_utilization=config.target_utilization,
+            cap_factor=config.cap_factor,
+        )
+        fees = [f_act(tx, prices, alpha) for tx in built.txs]
+        ur_total = sum(fee - f_ui(tx, prices) for fee, tx in zip(fees, built.txs))
+        sr_total = sum(
+            f_att(tx, prices) - fee
+            for fee, tx in zip(fees, built.txs)
+        )
+        revenue_burn = [burn_split(fee, config.gamma) for fee in fees]
+        used = utilization(built, mode=config.utilization_mode, object_ids=config.object_ids)
+        expected_records.append(
+            (
+                sum(fees),
+                ur_total,
+                sr_total,
+                sum(split[0] for split in revenue_burn),
+                sum(split[1] for split in revenue_burn),
+                used,
+                alpha,
+                eta,
+            )
+        )
+        history[block_index] = {obj: [] for obj in config.object_ids}
+        for tx in built.txs:
+            for obj in tx.declared:
+                history[block_index][obj].append((tx.priority, tx.compute))
+        states = update_prices(
+            {
+                obj: ObjectState(
+                    obj,
+                    states[obj].price,
+                    states[obj].target_utilization,
+                    utilization=used[obj],
+                    p_min=states[obj].p_min,
+                )
+                for obj in config.object_ids
+            },
+            eta=eta,
+            price_update=config.price_update,
+            p_min=config.p_min,
+        )
+        expected_prices.append({obj: states[obj].price for obj in config.object_ids})
+
+    for expected, observed in zip(expected_records, actual.records, strict=True):
+        fees, ur_total, sr_total, revenue, burned, used, alpha, eta = expected
+        assert observed.fees_paid == pytest.approx(fees)
+        assert observed.user_risk == pytest.approx(ur_total)
+        assert observed.scheduler_risk == pytest.approx(sr_total)
+        assert observed.scheduler_revenue == pytest.approx(revenue)
+        assert observed.burned == pytest.approx(burned)
+        assert observed.utilization == used
+        assert observed.alphas == alpha
+        assert observed.etas == eta
+    assert actual.price_history == tuple(expected_prices)
+    expected_history = {
+        block_index: {
+            object_id: tuple(observations)
+            for object_id, observations in objects.items()
+        }
+        for block_index, objects in history.items()
+    }
+    assert actual.history == expected_history

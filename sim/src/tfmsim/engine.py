@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import copy
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -31,6 +30,7 @@ class SimulationConfig:
     reference_prices: Mapping[int, float] | None = None
     epsilon: float = 1.0
     max_demand_multiplier: float = 2.0
+    history_window: int | None = None
 
     def __post_init__(self) -> None:
         if not self.object_ids or len(set(self.object_ids)) != len(self.object_ids):
@@ -59,6 +59,8 @@ class SimulationConfig:
             or self.max_demand_multiplier < 1
         ):
             raise ValueError("max_demand_multiplier must be finite and at least 1")
+        if self.history_window is not None and self.history_window <= 0:
+            raise ValueError("history_window must be positive or None")
 
         reference_prices = self.initial_prices if self.reference_prices is None else self.reference_prices
         if set(reference_prices) != objects or any(
@@ -137,17 +139,15 @@ class BlockRecord:
     alphas: Mapping[int, float] = field(default_factory=dict)
     etas: Mapping[int, float] = field(default_factory=dict)
     pi_hat: Mapping[int, float] | None = None
+    included_txs: tuple[Tx, ...] = ()
 
 
 @dataclass
 class SimState:
     object_states: dict[int, ObjectState]
-    history: dict[int, dict[int, list[tuple[float, float]]]]
-    price_history: list[dict[int, float]]
+    history: dict[int, dict[int, tuple[tuple[float, float], ...]]]
+    prices: tuple[float, ...]
     next_block_index: int = 0
-    blocks: list[Block] = field(default_factory=list)
-    records: list[BlockRecord] = field(default_factory=list)
-    tx_records: list[TxRecord] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -157,6 +157,7 @@ class SimulationResult:
     price_history: tuple[Mapping[int, float], ...]
     history: History
     tx_records: tuple[TxRecord, ...] = ()
+    final_state: SimState | None = None
 
 
 def create_initial_state(config: SimulationConfig) -> SimState:
@@ -174,13 +175,13 @@ def create_initial_state(config: SimulationConfig) -> SimState:
     return SimState(
         object_states=object_states,
         history={},
-        price_history=[{obj: object_states[obj].price for obj in object_ids}],
+        prices=tuple(object_states[obj].price for obj in object_ids),
     )
 
 
 def _validate_mechanism_gamma(mechanism: Mechanism, config: SimulationConfig) -> None:
     mechanism_gamma = getattr(mechanism, "gamma", None)
-    if mechanism_gamma is not None and mechanism_gamma != config.gamma:
+    if mechanism_gamma is not None and not math.isclose(mechanism_gamma, config.gamma):
         raise ValueError(
             f"mechanism gamma ({mechanism_gamma}) must match config gamma ({config.gamma})"
         )
@@ -200,6 +201,40 @@ def _demand_selected(tx: Tx, prices: Mapping[int, float], config: SimulationConf
     return tx.u <= keep_probability
 
 
+def _copy_history(
+    history: Mapping[int, Mapping[int, Sequence[tuple[float, float]]]],
+) -> dict[int, dict[int, tuple[tuple[float, float], ...]]]:
+    """Copy mutable history maps while safely sharing immutable observation tuples."""
+    return {
+        block: {
+            object_id: tuple(tuple(observation) for observation in observations)
+            for object_id, observations in objects.items()
+        }
+        for block, objects in history.items()
+    }
+
+
+def _copy_state(state: SimState) -> SimState:
+    """Create an independent dynamic-state snapshot without copying immutable data."""
+    return SimState(
+        object_states={
+            object_id: ObjectState(
+                object_id=object_state.object_id,
+                price=object_state.price,
+                target_utilization=object_state.target_utilization,
+                utilization=object_state.utilization,
+                alpha=object_state.alpha,
+                eta=object_state.eta,
+                p_min=object_state.p_min,
+            )
+            for object_id, object_state in state.object_states.items()
+        },
+        history=_copy_history(state.history),
+        prices=tuple(state.prices),
+        next_block_index=state.next_block_index,
+    )
+
+
 def step(
     state: SimState,
     candidate_txs: Sequence[Tx],
@@ -208,16 +243,18 @@ def step(
 ) -> tuple[SimState, BlockRecord, tuple[TxRecord, ...]]:
     """Advance a copied state through one block and return its records."""
     _validate_mechanism_gamma(mechanism, config)
-    new_state = copy.deepcopy(state)
+    new_state = _copy_state(state)
     block_index = new_state.next_block_index
     object_ids = config.object_ids
-    prices = {obj: new_state.object_states[obj].price for obj in object_ids}
+    if len(new_state.prices) != len(object_ids):
+        raise ValueError("state price tuple must align with configured object IDs")
+    prices = dict(zip(object_ids, new_state.prices, strict=True))
     eligible = [
         tx for tx in candidate_txs
         if _demand_selected(tx, prices, config)
     ]
 
-    mechanism_history = copy.deepcopy(new_state.history)
+    mechanism_history = new_state.history
     params = mechanism.params_for_block(
         block_index,
         mechanism_history,
@@ -236,7 +273,7 @@ def step(
     pi_hat = (
         diagnostics_method(
             block_index,
-            copy.deepcopy(mechanism_history),
+            mechanism_history,
             object_ids=object_ids,
         )
         if callable(diagnostics_method)
@@ -307,9 +344,10 @@ def step(
         alphas=alphas,
         etas=etas,
         pi_hat=pi_hat,
+        included_txs=tuple(built.txs),
     )
 
-    new_state.history[block_index] = {obj: [] for obj in object_ids}
+    new_state.history[block_index] = {obj: () for obj in object_ids}
     for tx in built.txs:
         observed_objects = (
             tx.declared
@@ -317,13 +355,21 @@ def step(
             else tx.declared if tx.used is None else tx.used
         )
         for obj in observed_objects:
-            new_state.history[block_index][obj].append((tx.priority, tx.compute))
+            new_state.history[block_index][obj] += ((tx.priority, tx.compute),)
+
+    if config.history_window is not None:
+        oldest_block = block_index - config.history_window + 1
+        new_state.history = {
+            history_block: block_history
+            for history_block, block_history in new_state.history.items()
+            if history_block >= oldest_block
+        }
 
     new_state.object_states = update_prices(
         {
             obj: ObjectState(
                 object_id=obj,
-                price=new_state.object_states[obj].price,
+                price=prices[obj],
                 target_utilization=new_state.object_states[obj].target_utilization,
                 utilization=built_utilization[obj],
                 alpha=alphas[obj],
@@ -336,12 +382,7 @@ def step(
         price_update=config.price_update,
         p_min=config.p_min,
     )
-    new_state.price_history.append(
-        {obj: new_state.object_states[obj].price for obj in object_ids}
-    )
-    new_state.blocks.append(built)
-    new_state.records.append(record)
-    new_state.tx_records.extend(transaction_records)
+    new_state.prices = tuple(new_state.object_states[obj].price for obj in object_ids)
     new_state.next_block_index += 1
     return new_state, record, tuple(transaction_records)
 
@@ -354,15 +395,30 @@ def simulate(
 ) -> SimulationResult:
     """Run candidate blocks as a plain loop over the copyable step transition."""
     _validate_mechanism_gamma(mechanism, config)
-    state = copy.deepcopy(initial_state) if initial_state is not None else create_initial_state(config)
+    state = _copy_state(initial_state) if initial_state is not None else create_initial_state(config)
     if set(state.object_states) != set(config.object_ids):
         raise ValueError("initial state object IDs must match configuration")
+    blocks: list[Block] = []
+    records: list[BlockRecord] = []
+    tx_records: list[TxRecord] = []
+    price_history: list[dict[int, float]] = [
+        dict(zip(config.object_ids, state.prices, strict=True))
+    ]
     for candidate_block in workload:
-        state, _, _ = step(state, candidate_block.txs, mechanism, config)
+        state, record, block_tx_records = step(state, candidate_block.txs, mechanism, config)
+        blocks.append(
+            Block(index=record.index, txs=list(record.included_txs))
+        )
+        records.append(record)
+        tx_records.extend(block_tx_records)
+        price_history.append(
+            {obj: state.object_states[obj].price for obj in config.object_ids}
+        )
     return SimulationResult(
-        blocks=tuple(state.blocks),
-        records=tuple(state.records),
-        price_history=tuple(copy.deepcopy(state.price_history)),
-        history=copy.deepcopy(state.history),
-        tx_records=tuple(state.tx_records),
+        blocks=tuple(blocks),
+        records=tuple(records),
+        price_history=tuple(price_history),
+        history=state.history,
+        tx_records=tuple(tx_records),
+        final_state=state,
     )
