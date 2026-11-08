@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from typing import Protocol
 
 from .estimators import Estimator, History
@@ -14,6 +14,8 @@ class Mechanism(Protocol):
         self,
         b: int,
         history: History,
+        *,
+        object_ids: tuple[int, ...] | None = None,
     ) -> dict[int, tuple[float, float]]:
         """Return per-object (alpha, eta) parameters for block b."""
 
@@ -44,11 +46,13 @@ class FixedAlpha:
         self,
         b: int,
         history: History,
+        *,
+        object_ids: tuple[int, ...] | None = None,
     ) -> dict[int, tuple[float, float]]:
         del b
         return {
             obj: (self.alpha, self.eta)
-            for obj in _object_ids(history, self.object_ids)
+            for obj in _object_ids(history, object_ids or self.object_ids)
         }
 
 
@@ -92,10 +96,12 @@ class DynamicAlpha:
         self,
         b: int,
         history: History,
+        *,
+        object_ids: tuple[int, ...] | None = None,
     ) -> dict[int, tuple[float, float]]:
         prior_history = {block: data for block, data in history.items() if block < b}
         params: dict[int, tuple[float, float]] = {}
-        for obj in _object_ids(history, self.object_ids):
+        for obj in _object_ids(history, object_ids or self.object_ids):
             pi_hat = self.estimator(prior_history, obj, self.pi0)
             if not math.isfinite(pi_hat) or pi_hat < 1.0:
                 raise ValueError("estimator must return a finite priority at least 1")

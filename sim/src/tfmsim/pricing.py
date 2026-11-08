@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from collections import defaultdict
 from dataclasses import replace
 
@@ -18,7 +19,11 @@ def utilization(block: Block, *, mode: str = "declared", object_ids=None) -> dic
             totals[obj] = 0.0
 
     for tx in block.txs:
-        objects = tx.declared if mode == "declared" else tx.used if tx.used else tx.declared
+        objects = (
+            tx.declared
+            if mode == "declared"
+            else tx.declared if tx.used is None else tx.used
+        )
         for obj in objects:
             totals[obj] += tx.compute
 
@@ -69,3 +74,24 @@ def update_object_price(
         p_min=next_p_min,
     )
     return replace(state, price=next_price, eta=next_eta, p_min=next_p_min)
+
+
+def update_prices(
+    states: Mapping[int, ObjectState],
+    *,
+    eta: float | Mapping[int, float] | None = None,
+    price_update: str = "exp",
+    p_min: float | Mapping[int, float] | None = None,
+) -> dict[int, ObjectState]:
+    """Return updated states using a scalar or per-object eta and price floor."""
+    updated: dict[int, ObjectState] = {}
+    for object_id, state in states.items():
+        object_eta = eta[object_id] if isinstance(eta, Mapping) else eta
+        object_floor = p_min[object_id] if isinstance(p_min, Mapping) else p_min
+        updated[object_id] = update_object_price(
+            state,
+            eta=object_eta,
+            price_update=price_update,
+            p_min=object_floor,
+        )
+    return updated
