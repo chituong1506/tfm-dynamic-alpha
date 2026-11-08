@@ -115,3 +115,20 @@ class DynamicAlpha:
             )
             params[obj] = (alpha, eta)
         return params
+
+    def diagnostics_for_block(
+        self,
+        b: int,
+        history: History,
+        *,
+        object_ids: tuple[int, ...] | None = None,
+    ) -> dict[int, float]:
+        """Return per-object priority forecasts used for block b."""
+        prior_history = {block: data for block, data in history.items() if block < b}
+        diagnostics: dict[int, float] = {}
+        for obj in _object_ids(history, object_ids or self.object_ids):
+            pi_hat = self.estimator(prior_history, obj, self.pi0)
+            if not math.isfinite(pi_hat) or pi_hat < 1.0:
+                raise ValueError("estimator must return a finite priority at least 1")
+            diagnostics[obj] = pi_hat
+        return diagnostics

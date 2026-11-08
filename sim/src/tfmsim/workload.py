@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 import numpy as np
@@ -16,6 +16,7 @@ class WorkloadConfig:
     n_blocks: int = 200
     n_objects: int = 3
     lambda_per_object: float | tuple[float, ...] = 8.0
+    max_demand_multiplier: float = 2.0
     epsilon: float = 1.0
     p_ref: float = 1.0
     popularity_zipf_s: float = 1.0
@@ -52,6 +53,8 @@ class WorkloadConfig:
                 raise ValueError("declared-object probabilities must sum to 1")
         if not math.isfinite(self.epsilon) or self.epsilon < 0 or not math.isfinite(self.p_ref) or self.p_ref <= 0:
             raise ValueError("epsilon must be non-negative and p_ref positive")
+        if not math.isfinite(self.max_demand_multiplier) or self.max_demand_multiplier < 1:
+            raise ValueError("max_demand_multiplier must be finite and at least 1")
         if not math.isfinite(self.popularity_zipf_s) or self.popularity_zipf_s <= 0:
             raise ValueError("popularity_zipf_s must be positive")
         if (
@@ -153,24 +156,18 @@ def expected_arrivals(
 def generate_workload(
     config: WorkloadConfig,
     rng: np.random.Generator,
-    *,
-    prices_by_block: Sequence[Mapping[int, float]] | None = None,
 ) -> list[Block]:
-    """Pre-generate every block and execution outcome from the supplied RNG."""
-    if prices_by_block is not None and len(prices_by_block) != config.n_blocks:
-        raise ValueError("prices_by_block must have one price mapping per configured block")
+    """Pre-generate candidate pools and execution outcomes from the supplied RNG."""
 
     popularity = np.arange(1, config.n_objects + 1, dtype=float) ** (-config.popularity_zipf_s)
     popularity /= popularity.sum()
     blocks: list[Block] = []
 
     for block_index in range(config.n_blocks):
-        prices = (
-            {obj: config.initial_price for obj in range(config.n_objects)}
-            if prices_by_block is None
-            else prices_by_block[block_index]
-        )
-        arrivals = expected_arrivals(config, prices)
+        arrivals = {
+            object_id: config.max_demand_multiplier * base_rate
+            for object_id, base_rate in enumerate(_arrival_rates(config))
+        }
         tx_specs: list[tuple[int, int]] = []
         for object_id in range(config.n_objects):
             count = int(rng.poisson(arrivals[object_id]))
@@ -232,6 +229,7 @@ def generate_workload(
                     declared=declared,
                     contingent=contingent,
                     used=used,
+                    u=float(rng.random()),
                 )
             )
         blocks.append(Block(index=block_index, txs=txs))

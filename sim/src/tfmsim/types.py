@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 
 
@@ -12,12 +13,15 @@ class Tx:
     declared: frozenset[int] = field(default_factory=frozenset)
     contingent: frozenset[int] = field(default_factory=frozenset)
     used: frozenset[int] | None = None
+    u: float = 0.0
 
     def __post_init__(self) -> None:
         if self.compute <= 0:
             raise ValueError("compute must be positive")
         if self.priority < 1:
             raise ValueError("priority must be at least 1")
+        if not math.isfinite(self.u) or not 0.0 <= self.u <= 1.0:
+            raise ValueError("u must be finite and lie in [0, 1]")
 
         declared = frozenset(self.declared)
         contingent = frozenset(self.contingent)
