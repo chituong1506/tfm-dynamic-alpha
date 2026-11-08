@@ -11,16 +11,28 @@ class Tx:
     priority: float = 1.0
     declared: frozenset[int] = field(default_factory=frozenset)
     contingent: frozenset[int] = field(default_factory=frozenset)
-    used: frozenset[int] = field(default_factory=frozenset)
+    used: frozenset[int] | None = None
 
     def __post_init__(self) -> None:
         if self.compute <= 0:
             raise ValueError("compute must be positive")
         if self.priority < 1:
             raise ValueError("priority must be at least 1")
-        object.__setattr__(self, "declared", frozenset(self.declared))
-        object.__setattr__(self, "contingent", frozenset(self.contingent))
-        object.__setattr__(self, "used", frozenset(self.used))
+
+        declared = frozenset(self.declared)
+        contingent = frozenset(self.contingent)
+        if not contingent.issubset(declared):
+            raise ValueError("contingent objects must be a subset of declared objects")
+
+        used = None if self.used is None else frozenset(self.used)
+        if used is not None and not used.issubset(declared):
+            raise ValueError("used objects must be a subset of declared objects")
+        if used is not None and not (declared - contingent).issubset(used):
+            raise ValueError("all non-contingent declared objects must be marked as used when used is provided")
+
+        object.__setattr__(self, "declared", declared)
+        object.__setattr__(self, "contingent", contingent)
+        object.__setattr__(self, "used", used)
 
     @property
     def t(self) -> float:

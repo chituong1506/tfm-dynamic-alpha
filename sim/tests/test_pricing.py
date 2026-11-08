@@ -6,13 +6,13 @@ from tfmsim.types import Block, ObjectState, Tx
 
 def test_utilization_modes():
     txs = [
-        Tx(id="t1", compute=1.0, priority=1.0, declared=frozenset({0, 1}), used=frozenset({0})),
+        Tx(id="t1", compute=1.0, priority=1.0, declared=frozenset({0, 1}), used=frozenset({0, 1})),
         Tx(id="t2", compute=2.0, priority=1.0, declared=frozenset({1}), used=frozenset({1})),
     ]
     block = Block(index=0, txs=txs)
 
     assert utilization(block, mode="declared") == {0: 1.0, 1: 3.0}
-    assert utilization(block, mode="used") == {0: 1.0, 1: 2.0}
+    assert utilization(block, mode="used") == {0: 1.0, 1: 3.0}
 
 
 def test_price_update_rules():
