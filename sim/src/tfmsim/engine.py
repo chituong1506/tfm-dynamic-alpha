@@ -31,6 +31,7 @@ class SimulationConfig:
     epsilon: float = 1.0
     max_demand_multiplier: float = 2.0
     history_window: int | None = None
+    shill_displaces: bool = False
 
     def __post_init__(self) -> None:
         if not self.object_ids or len(set(self.object_ids)) != len(self.object_ids):
@@ -145,7 +146,7 @@ class BlockRecord:
 @dataclass
 class SimState:
     object_states: dict[int, ObjectState]
-    history: dict[int, dict[int, tuple[tuple[float, float], ...]]]
+    history: dict[int, Mapping[int, tuple[tuple[float, float], ...]]]
     prices: tuple[float, ...]
     next_block_index: int = 0
 
@@ -202,16 +203,10 @@ def _demand_selected(tx: Tx, prices: Mapping[int, float], config: SimulationConf
 
 
 def _copy_history(
-    history: Mapping[int, Mapping[int, Sequence[tuple[float, float]]]],
-) -> dict[int, dict[int, tuple[tuple[float, float], ...]]]:
-    """Copy mutable history maps while safely sharing immutable observation tuples."""
-    return {
-        block: {
-            object_id: tuple(tuple(observation) for observation in observations)
-            for object_id, observations in objects.items()
-        }
-        for block, objects in history.items()
-    }
+    history: Mapping[int, Mapping[int, tuple[tuple[float, float], ...]]],
+) -> dict[int, Mapping[int, tuple[tuple[float, float], ...]]]:
+    """Copy the changing outer index and share completed immutable block histories."""
+    return dict(history)
 
 
 def _copy_state(state: SimState) -> SimState:
@@ -240,6 +235,7 @@ def step(
     candidate_txs: Sequence[Tx],
     mechanism: Mechanism,
     config: SimulationConfig,
+    forced_txs: Sequence[Tx] = (),
 ) -> tuple[SimState, BlockRecord, tuple[TxRecord, ...]]:
     """Advance a copied state through one block and return its records."""
     _validate_mechanism_gamma(mechanism, config)
@@ -279,13 +275,27 @@ def step(
         if callable(diagnostics_method)
         else None
     )
-    built = build_block(
-        eligible,
-        index=block_index,
-        max_compute=config.max_compute,
-        target_utilization=config.target_utilization,
-        cap_factor=config.cap_factor,
-    )
+    if config.shill_displaces:
+        included_block = build_block(
+            [*eligible, *forced_txs],
+            index=block_index,
+            max_compute=config.max_compute,
+            target_utilization=config.target_utilization,
+            cap_factor=config.cap_factor,
+        )
+    else:
+        honest_block = build_block(
+            eligible,
+            index=block_index,
+            max_compute=config.max_compute,
+            target_utilization=config.target_utilization,
+            cap_factor=config.cap_factor,
+        )
+        included_block = Block(
+            index=block_index,
+            txs=[*honest_block.txs, *forced_txs],
+        )
+    built = included_block
 
     paid = total_ur = total_sr = revenue = burned = 0.0
     transaction_records: list[TxRecord] = []
@@ -347,7 +357,9 @@ def step(
         included_txs=tuple(built.txs),
     )
 
-    new_state.history[block_index] = {obj: () for obj in object_ids}
+    block_history: dict[int, tuple[tuple[float, float], ...]] = {
+        obj: () for obj in object_ids
+    }
     for tx in built.txs:
         observed_objects = (
             tx.declared
@@ -355,7 +367,8 @@ def step(
             else tx.declared if tx.used is None else tx.used
         )
         for obj in observed_objects:
-            new_state.history[block_index][obj] += ((tx.priority, tx.compute),)
+            block_history[obj] += ((tx.priority, tx.compute),)
+    new_state.history[block_index] = block_history
 
     if config.history_window is not None:
         oldest_block = block_index - config.history_window + 1
@@ -392,6 +405,7 @@ def simulate(
     mechanism: Mechanism,
     config: SimulationConfig,
     initial_state: SimState | None = None,
+    forced_by_block: Mapping[int, Sequence[Tx]] | None = None,
 ) -> SimulationResult:
     """Run candidate blocks as a plain loop over the copyable step transition."""
     _validate_mechanism_gamma(mechanism, config)
@@ -405,7 +419,14 @@ def simulate(
         dict(zip(config.object_ids, state.prices, strict=True))
     ]
     for candidate_block in workload:
-        state, record, block_tx_records = step(state, candidate_block.txs, mechanism, config)
+        block_index = state.next_block_index
+        state, record, block_tx_records = step(
+            state,
+            candidate_block.txs,
+            mechanism,
+            config,
+            forced_txs=() if forced_by_block is None else forced_by_block.get(block_index, ()),
+        )
         blocks.append(
             Block(index=record.index, txs=list(record.included_txs))
         )

@@ -129,14 +129,15 @@ def test_step_and_initial_state_do_not_share_mutable_history():
         u=0.0,
     )
     advanced, _, _ = step(original, [tx], FixedAlpha(0.5, 0.125), config)
-    advanced.history[0][0] += ((8.0, 1.0),)
+    advanced.history[99] = {0: ()}
     advanced.prices = (50.0, 1.0)
     assert original.history == {}
     assert original.prices[0] == 1.0
 
     copied = simulate([], FixedAlpha(0.5, 0.125), config, initial_state=advanced)
-    copied.final_state.history[0][0] = copied.final_state.history[0][0] + ((9.0, 1.0),)
-    assert (9.0, 1.0) not in advanced.history[0][0]
+    copied.final_state.history[100] = {0: ()}
+    assert 99 in advanced.history
+    assert 100 not in advanced.history
 
 
 def test_price_thinning_reduces_included_transactions_and_zero_elasticity_keeps_all():
@@ -381,3 +382,124 @@ def test_outputs_match_pre_refactor_full_history_reference(mechanism_factory):
         for block_index, objects in history.items()
     }
     assert actual.history == expected_history
+
+
+def test_forced_tx_bypasses_filter_and_capacity_and_is_accounted():
+    config = SimulationConfig(
+        object_ids=(0,),
+        target_utilization={0: 1.0},
+        initial_prices={0: 2.0},
+        reference_prices={0: 1.0},
+        max_compute=1.0,
+        cap_factor=1.0,
+        gamma=0.5,
+        epsilon=1.0,
+        max_demand_multiplier=2.0,
+        p_min=0.01,
+    )
+    candidate = Tx(
+        id="candidate",
+        compute=1.0,
+        priority=2.0,
+        declared=frozenset({0}),
+        used=None,
+        u=0.0,
+    )
+    forced = Tx(
+        id="shill",
+        sender_type="shill",
+        compute=1.0,
+        priority=1.0,
+        declared=frozenset({0}),
+        contingent=frozenset({0}),
+        used=frozenset(),
+        u=1.0,
+    )
+    mechanism = FixedAlpha(0.5, 0.125)
+    state = create_initial_state(config)
+    new_state, record, tx_records = step(
+        state,
+        [candidate],
+        mechanism,
+        config,
+        forced_txs=[forced],
+    )
+    assert [tx.id for tx in record.included_txs] == ["candidate", "shill"]
+    assert record.tx_count == 2
+    assert record.fees_paid == pytest.approx(2.0 * 1.0 * 2.0 + 0.5 * 1.0 * 2.0)
+    assert record.utilization[0] == pytest.approx(2.0)
+    assert new_state.history[0][0] == ((2.0, 1.0), (1.0, 1.0))
+    shill_record = next(item for item in tx_records if item.tx_id == "shill")
+    assert shill_record.sender_type == "shill"
+    assert shill_record.f_act == pytest.approx(1.0)
+    assert shill_record.n_unused == 1
+
+
+def test_forced_txs_can_displace_only_when_configured():
+    candidate = Tx(
+        id="candidate",
+        compute=1.0,
+        priority=2.0,
+        declared=frozenset({0}),
+        used=None,
+        u=0.0,
+    )
+    forced = Tx(
+        id="forced",
+        sender_type="shill",
+        compute=1.0,
+        priority=3.0,
+        declared=frozenset({0}),
+        used=None,
+        u=1.0,
+    )
+    config = SimulationConfig(
+        object_ids=(0,),
+        target_utilization={0: 1.0},
+        initial_prices={0: 1.0},
+        max_compute=1.0,
+        cap_factor=1.0,
+        shill_displaces=True,
+    )
+    _, record, _ = step(
+        create_initial_state(config),
+        [candidate],
+        FixedAlpha(0.5, 0.125),
+        config,
+        forced_txs=[forced],
+    )
+    assert tuple(tx.id for tx in record.included_txs) == ("forced",)
+
+
+def test_simulate_forced_by_block_and_empty_forced_is_bit_identical():
+    workload = generate_workload(
+        WorkloadConfig(
+            n_blocks=3,
+            n_objects=2,
+            lambda_per_object=5.0,
+            epsilon=0.0,
+            max_demand_multiplier=1.0,
+        ),
+        np.random.default_rng(814),
+    )
+    config = _config(epsilon=0.0, max_demand_multiplier=1.0)
+    mechanism = FixedAlpha(0.5, 0.125)
+    baseline = simulate(workload, mechanism, config)
+    explicitly_empty = simulate(workload, mechanism, config, forced_by_block={})
+    assert explicitly_empty == baseline
+
+    forced = Tx(
+        id="forced-scheduler",
+        sender_type="shill",
+        declared=frozenset({0}),
+        used=None,
+        u=1.0,
+    )
+    with_forced = simulate(
+        workload[:1],
+        mechanism,
+        config,
+        forced_by_block={0: [forced]},
+    )
+    assert any(tx.id == "forced-scheduler" for tx in with_forced.blocks[0].txs)
+    assert any(tx_record.sender_type == "shill" for tx_record in with_forced.tx_records)
